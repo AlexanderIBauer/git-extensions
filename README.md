@@ -1,5 +1,3 @@
-# my-git
-
 Personal git extensions — custom commands, refs, and hooks.
 
 Each top-level directory is a self-contained, independently installable
