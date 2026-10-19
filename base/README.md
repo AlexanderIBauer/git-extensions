@@ -30,6 +30,34 @@ git base install              # wire up this repo's hooks
 Existing hooks are preserved: a foreign `post-checkout` etc. is moved to
 `<hook>.local` and chained. `git base uninstall` restores them.
 
+### Per user / per system
+
+`git base install` wires up a single repo. To manage it once for every repo,
+install into git's shared hook path instead (git's own mechanism for per-user
+and machine-wide hooks, `core.hooksPath`):
+
+```sh
+git base install --global     # per user   -> ~/.config/git/base-hooks
+git base install --system     # machine-wide (usually needs sudo)
+```
+
+A shared install is **opt-in per repo**, so it never starts writing refs into
+repos you haven't asked it to. Turn tracking on where you want it:
+
+```sh
+git base enable               # this repo   (sets base.enabled true)
+git base disable              # this repo
+git config --global base.enabled true   # or: on everywhere
+```
+
+The shared hooks still run each repo's own `.git/hooks` (which `core.hooksPath`
+would otherwise shadow), and a repo already set up with a local `git base
+install` keeps working under a shared install. `git base enable` / `disable`
+flips tracking without removing anything, in any mode.
+
+Pass `--hooks-dir=DIR` to any of these to choose the directory. Remove a shared
+install with `git base uninstall --global` / `--system`.
+
 ## Usage
 
 Set / fix bases (the base is static — set it once; these are for corrections):

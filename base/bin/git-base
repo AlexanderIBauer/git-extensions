@@ -77,6 +77,9 @@ hook_reference_transaction() {
 cmd_hook() {
 	_name=${1:-}
 	[ $# -gt 0 ] && shift
+	# Honor an explicit opt-out; unset means on (a local install is opt-in by
+	# existing, a shared install gates on =true in its wrapper before we get here).
+	[ "$(git config --bool base.enabled 2>/dev/null)" = false ] && exit 0
 	case "$_name" in
 	post-checkout) hook_post_checkout "$@" ;;
 	post-rewrite) hook_post_rewrite "$@" ;;
@@ -215,16 +218,61 @@ install_hook() {
 	chmod +x "$_hp"
 }
 
-cmd_install() {
+# A shared hook (for core.hooksPath at --global/--system scope). Because
+# core.hooksPath shadows a repo's own .git/hooks, the wrapper reaches back to
+# them via --git-common-dir and runs them too, and it only runs base logic when
+# the repo opts in with base.enabled=true (so a shared install does not start
+# writing refs into every repo on the machine).
+_emit_global_wrapper() {
+	# $1 kind (stdin|nostdin) -> template with @GB@/@NAME@ tokens
+	if [ "$1" = stdin ]; then
+		cat <<'T'
+#!/bin/sh
+# @MARK@ global (@NAME@) -- via core.hooksPath; `git base install --global|--system`
+_gcd=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+case "$_gcd" in /*) ;; *) _gcd="$(pwd)/$_gcd" ;; esac
+_lh="$_gcd/hooks/@NAME@"
+_base=0 _foreign=0
+if [ -x "$_lh" ]; then
+	if grep -q 'git-base managed hook' "$_lh" 2>/dev/null; then _base=1; else _foreign=1; fi
+fi
+_en=0; [ "$(git config --bool base.enabled 2>/dev/null)" = true ] && _en=1
+_in=$(cat)
+[ "$_foreign" = 1 ] && printf '%s\n' "$_in" | "$_lh" "$@"
+if [ "$_base" = 1 ]; then printf '%s\n' "$_in" | "$_lh" "$@"
+elif [ "$_en" = 1 ]; then printf '%s\n' "$_in" | "@GB@" hook @NAME@ "$@"; fi
+exit 0
+T
+	else
+		cat <<'T'
+#!/bin/sh
+# @MARK@ global (@NAME@) -- via core.hooksPath; `git base install --global|--system`
+_gcd=$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+case "$_gcd" in /*) ;; *) _gcd="$(pwd)/$_gcd" ;; esac
+_lh="$_gcd/hooks/@NAME@"
+_base=0 _foreign=0
+if [ -x "$_lh" ]; then
+	if grep -q 'git-base managed hook' "$_lh" 2>/dev/null; then _base=1; else _foreign=1; fi
+fi
+[ "$_foreign" = 1 ] && "$_lh" "$@"
+[ "$_base" = 1 ] && exec "$_lh" "$@"
+[ "$(git config --bool base.enabled 2>/dev/null)" = true ] && exec "@GB@" hook @NAME@ "$@"
+exit 0
+T
+	fi
+}
+
+install_global_hook() {
+	_dir=$1 _name=$2 _kind=$3 _gb=$4
+	_gb_esc=$(printf '%s' "$_gb" | sed 's/[|&\]/\\&/g')
+	_emit_global_wrapper "$_kind" |
+		sed "s|@GB@|$_gb_esc|g; s|@NAME@|$_name|g; s|@MARK@|git-base managed hook|g" >"$_dir/$_name"
+	chmod +x "$_dir/$_name"
+}
+
+install_local() {
+	_reflog=$1 _seed=$2
 	base_require_repo
-	_reflog=0 _seed=0
-	for _a in "$@"; do
-		case "$_a" in
-		--reflog) _reflog=1 ;;
-		--seed) _seed=1 ;;
-		*) base_die "install: unknown option '$_a'" ;;
-		esac
-	done
 	_hooks=$(git rev-parse --git-path hooks) || base_die "cannot locate hooks dir"
 	mkdir -p "$_hooks"
 	_gb="$bindir/git-base"
@@ -248,7 +296,64 @@ cmd_install() {
 	printf 'installed BASE hooks in %s\n' "$_hooks"
 }
 
-cmd_uninstall() {
+install_shared() {
+	_scope=$1 _dir=$2
+	if [ -z "$_dir" ]; then
+		if [ "$_scope" = global ]; then
+			_dir="${XDG_CONFIG_HOME:-$HOME/.config}/git/base-hooks"
+		else
+			_dir=/etc/git/base-hooks
+		fi
+	fi
+	mkdir -p "$_dir" 2>/dev/null ||
+		base_die "cannot create $_dir (permissions? --system usually needs sudo)"
+	_gb="$bindir/git-base"
+	install_global_hook "$_dir" post-checkout nostdin "$_gb"
+	install_global_hook "$_dir" post-rewrite stdin "$_gb"
+	install_global_hook "$_dir" reference-transaction stdin "$_gb"
+	git config "--$_scope" core.hooksPath "$_dir" ||
+		base_die "failed to set core.hooksPath (--$_scope); need permissions?"
+	printf 'installed %s BASE hooks in %s\n' "$_scope" "$_dir"
+	printf 'set core.hooksPath (--%s) -> %s\n\n' "$_scope" "$_dir"
+	echo 'Under a shared install base tracking is OFF until a repo opts in, so it'
+	echo 'never touches repos you have not asked it to. Turn it on:'
+	echo '  git base enable                      # this repo'
+	printf '  git config --%s base.enabled true   # every repo\n' "$_scope"
+}
+
+cmd_install() {
+	_scope=local _reflog=0 _seed=0 _dir=
+	for _a in "$@"; do
+		case "$_a" in
+		--global) _scope=global ;;
+		--system) _scope=system ;;
+		--reflog) _reflog=1 ;;
+		--seed) _seed=1 ;;
+		--hooks-dir=*) _dir=${_a#--hooks-dir=} ;;
+		*) base_die "install: unknown option '$_a'" ;;
+		esac
+	done
+	if [ "$_scope" = local ]; then
+		install_local "$_reflog" "$_seed"
+	else
+		install_shared "$_scope" "$_dir"
+	fi
+}
+
+cmd_enable() {
+	base_require_repo
+	git config base.enabled true
+	base_repoint "$(base_current_branch)"
+	echo "base tracking enabled for this repo"
+}
+
+cmd_disable() {
+	base_require_repo
+	git config base.enabled false
+	echo "base tracking disabled for this repo (refs/base/* kept)"
+}
+
+uninstall_local() {
 	base_require_repo
 	_hooks=$(git rev-parse --git-path hooks) || base_die "cannot locate hooks dir"
 	for _name in post-checkout post-rewrite reference-transaction; do
@@ -267,6 +372,34 @@ cmd_uninstall() {
 	echo "  (clear them with: git set-base --unset / git update-ref -d refs/base/<branch>)"
 }
 
+uninstall_shared() {
+	_scope=$1 _dir=$2
+	[ -n "$_dir" ] || _dir=$(git config "--$_scope" --get core.hooksPath 2>/dev/null)
+	git config "--$_scope" --unset core.hooksPath 2>/dev/null || true
+	if [ -n "$_dir" ] && [ -d "$_dir" ]; then
+		for _name in post-checkout post-rewrite reference-transaction; do
+			_hp="$_dir/$_name"
+			[ -e "$_hp" ] && grep -q 'git-base managed hook' "$_hp" 2>/dev/null || continue
+			rm -f "$_hp" && printf '  removed %s\n' "$_hp"
+		done
+		rmdir "$_dir" 2>/dev/null && printf '  removed empty %s\n' "$_dir"
+	fi
+	printf 'unset core.hooksPath (--%s)\n' "$_scope"
+}
+
+cmd_uninstall() {
+	_scope=local _dir=
+	for _a in "$@"; do
+		case "$_a" in
+		--global) _scope=global ;;
+		--system) _scope=system ;;
+		--hooks-dir=*) _dir=${_a#--hooks-dir=} ;;
+		*) base_die "uninstall: unknown option '$_a'" ;;
+		esac
+	done
+	if [ "$_scope" = local ]; then uninstall_local; else uninstall_shared "$_scope" "$_dir"; fi
+}
+
 cmd_help() {
 	cat <<'EOF'
 git base -- branch BASE refs (the commit a branch forks from)
@@ -274,9 +407,15 @@ git base -- branch BASE refs (the commit a branch forks from)
   git base                    show the current branch's base
   git base list               list all refs/base/* (? = branch gone)
   git base install [--reflog] [--seed]
-                              install post-checkout/post-rewrite/
-                              reference-transaction hooks into this repo
-  git base uninstall          remove them (restores any chained hooks)
+                              install the hooks into THIS repo (.git/hooks)
+  git base install --global [--hooks-dir=DIR]
+                              install once per user (core.hooksPath); applies
+                              to every repo that opts in with `git base enable`
+  git base install --system [--hooks-dir=DIR]
+                              same, machine-wide (usually needs sudo)
+  git base enable | disable   opt this repo in / out (sets base.enabled)
+  git base uninstall [--global|--system]
+                              remove the hooks at that scope
 
 Set/fix bases with `git set-base` (see: git set-base -h).
 
@@ -295,6 +434,8 @@ show) cmd_show ;;
 list | ls) cmd_list ;;
 install) cmd_install "$@" ;;
 uninstall) cmd_uninstall "$@" ;;
+enable) cmd_enable ;;
+disable) cmd_disable ;;
 hook) cmd_hook "$@" ;;
 _worker) cmd_worker "$@" ;;
 -h | --help | help) cmd_help ;;

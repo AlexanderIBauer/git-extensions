@@ -19,3 +19,6 @@ Put the commands on your `PATH`, then enable per repo:
 ./install.sh                   # symlink git-* commands into ~/.local/bin
 cd /path/to/repo && git base install
 ```
+
+Or set it up once for every repo (per user or machine-wide) with
+`git base install --global` / `--system`; see [base/README.md](base/README.md).
