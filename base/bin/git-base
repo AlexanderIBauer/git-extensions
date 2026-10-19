@@ -1,0 +1,302 @@
+#!/bin/sh
+# git-base -- inspect and administer the BASE ref system, dispatch git hooks,
+# and run detached worker actions. See base/README.md.
+#
+#   git base                 show the current branch's base
+#   git base list            list every refs/base/* and its branch
+#   git base install [opts]  install the hooks into the current repo
+#   git base uninstall       remove the hooks (restoring any chained ones)
+#   git base hook <name> ..  (internal) hook entry point
+#   git base _worker <a> ..  (internal) detached ref-writing worker
+set -u
+
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+bindir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+. "$bindir/../lib/base-common.sh"
+
+# --- hook handlers -----------------------------------------------------------
+
+hook_post_checkout() {
+	# args: <prev-head> <new-head> <flag>  (flag 1 = branch/ref checkout)
+	[ "${3:-0}" = 1 ] || return 0 # file checkout: leave BASE/refs alone
+	base_repoint "$(base_current_branch)" # detached -> empty -> clears BASE
+	return 0
+}
+
+hook_post_rewrite() {
+	# arg: amend|rebase ; stdin: "<old> <new>" per rewritten commit, oldest first.
+	if [ "${1:-}" != rebase ]; then
+		cat >/dev/null 2>&1 # amend/other: drain stdin, base unchanged
+		return 0
+	fi
+	if ! read -r _old _new _rest; then
+		return 0
+	fi
+	cat >/dev/null 2>&1 # drain remaining pairs
+	_br=$(base_current_branch)
+	[ -n "$_br" ] || return 0
+	# The onto-point is the parent of the oldest rewritten commit. The base
+	# moves only when the branch was replayed onto a *different* commit
+	# (a new upstream or --onto); an in-place `rebase -i` keeps it the same.
+	_old_onto=$(git rev-parse --verify --quiet "${_old}^" 2>/dev/null || true)
+	_new_onto=$(git rev-parse --verify --quiet "${_new}^" 2>/dev/null || true)
+	if [ -n "$_old_onto" ] && [ -n "$_new_onto" ] && [ "$_old_onto" != "$_new_onto" ]; then
+		base_spawn rebase "$_br" "$_new_onto"
+	else
+		base_log info "rebase on '$_br' kept onto-point; base unchanged"
+	fi
+	# A rebase detaches HEAD onto the target, which fires post-checkout and
+	# clears BASE; no checkout fires on re-attach, so restore BASE here.
+	base_repoint "$_br"
+	return 0
+}
+
+hook_reference_transaction() {
+	# arg: prepared|committed|aborted ; stdin: "<old> <new> <ref>" per update.
+	[ "${1:-}" = committed ] || return 0
+	while read -r _old _new _ref; do
+		case "$_ref" in
+		refs/heads/*) ;;
+		*) continue ;; # only branch tips; ignores refs/base/*, BASE, HEAD, tags...
+		esac
+		case "$_new" in ref:*) continue ;; esac # symbolic, not a branch tip
+		_br=${_ref#refs/heads/}
+		# new=0 always means the branch ref went away (git branch -D reports
+		# old=0/new=0; git branch -m reports old=<sha>/new=0). old=0 with a
+		# non-zero new is a creation. A normal update (commit/reset/merge) has
+		# both non-zero and is deliberately ignored.
+		if base_is_zero_oid "$_new"; then
+			base_spawn del-branch "$_br" "$_old" # deleted/renamed; $_old aids rename carry
+		elif base_is_zero_oid "$_old"; then
+			base_spawn init-branch "$_br" "$_new" # branch created
+		fi
+	done
+	return 0
+}
+
+cmd_hook() {
+	_name=${1:-}
+	[ $# -gt 0 ] && shift
+	case "$_name" in
+	post-checkout) hook_post_checkout "$@" ;;
+	post-rewrite) hook_post_rewrite "$@" ;;
+	reference-transaction) hook_reference_transaction "$@" ;;
+	*) base_log warning "unknown hook invoked: $_name" ;;
+	esac
+	exit 0 # a hook must never fail the git command that triggered it
+}
+
+# --- detached worker (the only code that writes refs from a hook) ------------
+
+cmd_worker() {
+	_action=${1:-}
+	[ $# -gt 0 ] && shift
+	case "$_action" in
+	init-branch) # <branch> <sha>
+		if base_write_ref "$1" "$2"; then
+			base_log info "init base($1) = $2"
+		else
+			base_log err "failed to init base($1)"
+		fi
+		[ "$(base_current_branch)" = "$1" ] && base_repoint "$1"
+		;;
+	del-branch) # <branch> <old-tip-or-zero>
+		# Guard against a false positive (old=0/new=0 that was not a deletion):
+		# only drop the base if the branch is really gone.
+		git rev-parse --verify --quiet "refs/heads/$1" >/dev/null 2>&1 && exit 0
+		_oldbase=$(git rev-parse --verify --quiet "refs/base/$1" 2>/dev/null || true)
+		# Rename carry-over. `git branch -m old new` reports the deletion of the
+		# old name with old=<its tip> and silently creates the new name at that
+		# same tip (with no creation event). So before dropping the old base,
+		# hand it to any branch now sitting at that tip that has no base yet.
+		# `git branch -D` reports old=0, so this is skipped for a real deletion.
+		if [ -n "$_oldbase" ] && ! base_is_zero_oid "${2:-0}"; then
+			git for-each-ref --format='%(objectname) %(refname:short)' refs/heads/ |
+				while read -r _tip _cand; do
+					[ "$_tip" = "$2" ] || continue
+					git rev-parse --verify --quiet "refs/base/$_cand" >/dev/null 2>&1 && continue
+					base_write_ref "$_cand" "$_oldbase" &&
+						base_log info "rename: carried base($1) to '$_cand' = $_oldbase"
+					[ "$(base_current_branch)" = "$_cand" ] && base_repoint "$_cand"
+				done
+		fi
+		base_del_ref "$1" && base_log info "deleted base($1)"
+		base_fix_dangling # e.g. plain delete where BASE pointed at refs/base/$1
+		;;
+	rebase) # <branch> <new-base-sha>
+		if base_write_ref "$1" "$2"; then
+			base_log info "rebase moved base($1) = $2"
+		else
+			base_log err "failed to move base($1) after rebase"
+			base_clear
+		fi
+		[ "$(base_current_branch)" = "$1" ] && base_repoint "$1"
+		;;
+	*) base_log warning "unknown worker action: $_action" ;;
+	esac
+	exit 0
+}
+
+# --- reader / admin ----------------------------------------------------------
+
+cmd_show() {
+	base_require_repo
+	_br=$(base_current_branch)
+	if [ -z "$_br" ]; then
+		echo "HEAD is detached; no base."
+		return 0
+	fi
+	if ! git rev-parse --verify --quiet BASE >/dev/null 2>&1; then
+		printf "no base set for '%s'  (set one with: git set-base)\n" "$_br"
+		return 0
+	fi
+	_sha=$(git rev-parse BASE)
+	printf 'branch %s\n  base  %s  %s\n' \
+		"$_br" "$(git rev-parse --short "$_sha")" "$(git show -s --format=%s "$_sha" 2>/dev/null)"
+	printf '  %s commit(s) ahead of base   (git log BASE..HEAD)\n' \
+		"$(git rev-list --count BASE..HEAD 2>/dev/null || echo '?')"
+}
+
+cmd_list() {
+	base_require_repo
+	git for-each-ref --format='%(refname)' refs/base/ | while read -r _r; do
+		_b=${_r#refs/base/}
+		if git rev-parse --verify --quiet "refs/heads/$_b" >/dev/null 2>&1; then
+			_mk=' '
+		else
+			_mk='?' # orphan: base exists but branch is gone
+		fi
+		printf '%s %-24s %s  %s\n' "$_mk" "$_b" \
+			"$(git rev-parse --short "$_r")" "$(git show -s --format=%s "$_r" 2>/dev/null)"
+	done
+}
+
+_emit_wrapper() {
+	# $1 kind (stdin|nostdin)  $2 chain (0|1) -> template with @GB@/@NAME@ tokens
+	if [ "$1" = stdin ] && [ "$2" = 1 ]; then
+		cat <<'T'
+#!/bin/sh
+# @MARK@ (@NAME@) -- managed by `git base install`; remove with `git base uninstall`
+_in=$(cat)
+[ -x "$0.local" ] && printf '%s\n' "$_in" | "$0.local" "$@"
+printf '%s\n' "$_in" | "@GB@" hook @NAME@ "$@"
+T
+	elif [ "$1" = nostdin ] && [ "$2" = 1 ]; then
+		cat <<'T'
+#!/bin/sh
+# @MARK@ (@NAME@) -- managed by `git base install`; remove with `git base uninstall`
+[ -x "$0.local" ] && "$0.local" "$@"
+exec "@GB@" hook @NAME@ "$@"
+T
+	else
+		cat <<'T'
+#!/bin/sh
+# @MARK@ (@NAME@) -- managed by `git base install`; remove with `git base uninstall`
+exec "@GB@" hook @NAME@ "$@"
+T
+	fi
+}
+
+install_hook() {
+	_dir=$1 _name=$2 _kind=$3 _gb=$4
+	_hp="$_dir/$_name"
+	if [ -e "$_hp" ] && ! grep -q 'git-base managed hook' "$_hp" 2>/dev/null; then
+		# A foreign hook is here: preserve it as <hook>.local so we chain to it.
+		if [ ! -e "$_hp.local" ]; then
+			mv "$_hp" "$_hp.local"
+			printf '  chained existing %s -> %s.local\n' "$_name" "$_name"
+		fi
+	fi
+	_chain=0
+	[ -e "$_hp.local" ] && _chain=1
+	_gb_esc=$(printf '%s' "$_gb" | sed 's/[|&\]/\\&/g')
+	_emit_wrapper "$_kind" "$_chain" |
+		sed "s|@GB@|$_gb_esc|g; s|@NAME@|$_name|g; s|@MARK@|git-base managed hook|g" >"$_hp"
+	chmod +x "$_hp"
+}
+
+cmd_install() {
+	base_require_repo
+	_reflog=0 _seed=0
+	for _a in "$@"; do
+		case "$_a" in
+		--reflog) _reflog=1 ;;
+		--seed) _seed=1 ;;
+		*) base_die "install: unknown option '$_a'" ;;
+		esac
+	done
+	_hooks=$(git rev-parse --git-path hooks) || base_die "cannot locate hooks dir"
+	mkdir -p "$_hooks"
+	_gb="$bindir/git-base"
+	install_hook "$_hooks" post-checkout nostdin "$_gb"
+	install_hook "$_hooks" post-rewrite stdin "$_gb"
+	install_hook "$_hooks" reference-transaction stdin "$_gb"
+	git config base.installed true
+	git config base.version "$BASE_VERSION"
+	if [ "$_reflog" = 1 ]; then
+		git config base.reflog true
+		echo "  enabled refs/base reflog history (git reflog refs/base/<branch>)"
+	fi
+	if [ "$_seed" = 1 ]; then
+		_cb=$(base_current_branch)
+		if [ -n "$_cb" ]; then
+			base_write_ref "$_cb" "$(git rev-parse HEAD)"
+			printf '  seeded base(%s) = HEAD\n' "$_cb"
+		fi
+	fi
+	base_repoint "$(base_current_branch)"
+	printf 'installed BASE hooks in %s\n' "$_hooks"
+}
+
+cmd_uninstall() {
+	base_require_repo
+	_hooks=$(git rev-parse --git-path hooks) || base_die "cannot locate hooks dir"
+	for _name in post-checkout post-rewrite reference-transaction; do
+		_hp="$_hooks/$_name"
+		[ -e "$_hp" ] && grep -q 'git-base managed hook' "$_hp" 2>/dev/null || continue
+		if [ -e "$_hp.local" ]; then
+			mv -f "$_hp.local" "$_hp"
+			printf '  restored %s from %s.local\n' "$_name" "$_name"
+		else
+			rm -f "$_hp"
+			printf '  removed %s\n' "$_name"
+		fi
+	done
+	git config --unset base.installed 2>/dev/null || true
+	echo "uninstalled BASE hooks. refs/base/* and BASE left intact"
+	echo "  (clear them with: git set-base --unset / git update-ref -d refs/base/<branch>)"
+}
+
+cmd_help() {
+	cat <<'EOF'
+git base -- branch BASE refs (the commit a branch forks from)
+
+  git base                    show the current branch's base
+  git base list               list all refs/base/* (? = branch gone)
+  git base install [--reflog] [--seed]
+                              install post-checkout/post-rewrite/
+                              reference-transaction hooks into this repo
+  git base uninstall          remove them (restores any chained hooks)
+
+Set/fix bases with `git set-base` (see: git set-base -h).
+
+Refs created:
+  refs/base/<branch>   a branch's base commit (real ref, gc-protected)
+  BASE                 per-worktree symbolic ref -> refs/base/<current branch>
+EOF
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+_sub=${1:-show}
+[ $# -gt 0 ] && shift
+case "$_sub" in
+show) cmd_show ;;
+list | ls) cmd_list ;;
+install) cmd_install "$@" ;;
+uninstall) cmd_uninstall "$@" ;;
+hook) cmd_hook "$@" ;;
+_worker) cmd_worker "$@" ;;
+-h | --help | help) cmd_help ;;
+*) base_die "unknown command: '$_sub' (try: git base --help)" ;;
+esac

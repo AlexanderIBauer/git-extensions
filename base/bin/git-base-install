@@ -1,0 +1,7 @@
+#!/bin/sh
+# git-base-install -- convenience alias for `git base install`.
+# Lets you run `git base-install [--reflog] [--seed]` inside any repo.
+set -u
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+bindir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+exec "$bindir/git-base" install "$@"

@@ -1,0 +1,79 @@
+#!/bin/sh
+# git-set-base -- set or fix a branch's base commit.
+#
+#   git set-base                   base(current) = HEAD
+#   git set-base <ref>             base(current) = <ref>
+#   git set-base <branch> <ref>    base(<branch>) = <ref>   (BASE repointed only
+#                                  if <branch> is the current branch)
+#   git set-base -l | --list       list all bases          (= git base list)
+#   git set-base -d <branch>       delete a branch's base
+#   git set-base --unset           delete the current branch's base + clear BASE
+set -u
+
+self=$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")
+bindir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
+. "$bindir/../lib/base-common.sh"
+
+# Print the leading comment block (the lines after the shebang, up to the first
+# non-comment line) as usage text.
+usage() { awk 'NR>1{if($0 !~ /^#/)exit; sub(/^# ?/,""); print}' "$self"; }
+
+base_require_repo
+
+case "${1:-}" in
+-h | --help)
+	usage
+	exit 0
+	;;
+-l | --list)
+	exec "$bindir/git-base" list
+	;;
+-d | --delete)
+	[ $# -eq 2 ] || base_die "usage: git set-base -d <branch>"
+	git rev-parse --verify --quiet "refs/base/$2" >/dev/null 2>&1 ||
+		base_die "no base set for '$2'"
+	base_del_ref "$2"
+	[ "$(base_current_branch)" = "$2" ] && base_clear
+	printf 'deleted base(%s)\n' "$2"
+	exit 0
+	;;
+--unset)
+	_cb=$(base_current_branch)
+	[ -n "$_cb" ] || base_die "HEAD is detached; nothing to unset"
+	base_del_ref "$_cb"
+	base_clear
+	printf 'unset base(%s)\n' "$_cb"
+	exit 0
+	;;
+-*)
+	base_die "unknown option '$1' (try: git set-base -h)"
+	;;
+esac
+
+case $# in
+0)
+	_br=$(base_current_branch)
+	[ -n "$_br" ] || base_die "HEAD is detached; use: git set-base <branch> <ref>"
+	_ci=HEAD
+	;;
+1)
+	_br=$(base_current_branch)
+	[ -n "$_br" ] || base_die "HEAD is detached; use: git set-base <branch> <ref>"
+	_ci=$1
+	;;
+2)
+	_br=$1
+	_ci=$2
+	git rev-parse --verify --quiet "refs/heads/$_br" >/dev/null 2>&1 ||
+		base_die "no such branch: '$_br'"
+	;;
+*)
+	base_die "too many arguments (try: git set-base -h)"
+	;;
+esac
+
+_sha=$(base_resolve_commit "$_ci") || base_die "not a commit: '$_ci'"
+base_write_ref "$_br" "$_sha"
+[ "$(base_current_branch)" = "$_br" ] && base_repoint "$_br"
+printf 'base(%s) = %s  %s\n' "$_br" \
+	"$(git rev-parse --short "$_sha")" "$(git show -s --format=%s "$_sha" 2>/dev/null)"
